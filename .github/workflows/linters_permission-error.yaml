@@ -1,0 +1,114 @@
+# Controlled CI Error: Permission Error
+# Base workflow: linters.yml
+# Error type: permission-error
+# Description: Escalates the permissions block to request write access to
+#   pull-requests and issues (beyond what the repository settings allow for
+#   fork-sourced PRs), and then explicitly calls the GitHub API to write a
+#   PR comment using GITHUB_TOKEN. On fork PRs the token is read-only, so the
+#   curl call returns HTTP 403 Forbidden and the step exits non-zero.
+#   On non-fork runs the write attempt targets a deliberately non-existent
+#   issue number (0), which the API rejects with HTTP 404/422.
+
+name: Linters [permission-error]
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches:
+      - main
+      - v[0-9]+.x-staging
+      - v[0-9]+.x
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.14'
+  NODE_VERSION: lts/*
+
+# ERROR INJECTION: Request write permissions that are intentionally withheld
+# for fork-sourced pull requests by GitHub's security model. The subsequent
+# API write step will receive HTTP 403 Forbidden on any fork PR, failing the
+# job at permission enforcement time rather than at lint time.
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  lint-addon-docs:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Use Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Environment Information
+        run: npx envinfo
+      - name: Lint addon docs
+        run: NODE=$(command -v node) make lint-addon-docs
+  lint-js-and-md:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Use Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Environment Information
+        run: npx envinfo
+      - name: Lint JavaScript files
+        run: |
+          set +e
+          NODE=$(command -v node) make lint-js
+          EXIT_CODE="$?"
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo 'ERROR: The JavaScript lint validation failed.'
+            exit "$EXIT_CODE"
+          fi
+      - name: Lint markdown files
+        run: |
+          echo "::add-matcher::.github/workflows/remark-lint-problem-matcher.json"
+          NODE=$(command -v node) make lint-md
+      # ERROR INJECTION: Attempt to post a comment on issue #0, which does not
+      # exist. The GitHub REST API returns HTTP 422 Unprocessable Entity.
+      # Combined with `--fail`, curl exits non-zero, failing the step.
+      # On fork PRs the GITHUB_TOKEN has no write scope at all, so the API
+      # instead returns HTTP 403 Forbidden — either way the step fails.
+      - name: Report lint results via API
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl --fail -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/0/comments" \
+            -d '{"body":"Lint completed."}'
+  lint-py:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          allow-prereleases: true
+      - name: Environment Information
+        run: npx envinfo
+      - name: Lint Python
+        run: |
+          make lint-py-build
+          make lint-py

@@ -1,0 +1,118 @@
+# Controlled CI Error: Package Dependency Error
+# Base workflow: tools.yml
+# Error type: dependency-error
+# Description: Introduces a dependency conflict by requiring an incompatible
+#   version of a Python package (gcovr==0.0.0) that does not exist on PyPI.
+#   The pip install step fails with a "No matching distribution found" error,
+#   preventing subsequent dep-update scripts from running.
+
+name: Tools and deps update [dependency-error]
+
+on:
+  workflow_dispatch:
+    inputs:
+      id:
+        description: The ID of the job to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - acorn
+          - ada
+          - libuv
+          - undici
+          - zlib
+
+env:
+  PYTHON_VERSION: '3.14'
+
+permissions:
+  contents: read
+
+jobs:
+  tools-deps-update:
+    if: github.repository == 'nodejs/node' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: acorn
+            subsystem: deps
+            label: dependencies
+            run: |
+              ./tools/dep_updaters/update-acorn.sh > temp-output
+              cat temp-output
+              tail -n1 temp-output | grep "NEW_VERSION=" >> "$GITHUB_ENV" || true
+              rm temp-output
+          - id: ada
+            subsystem: deps
+            label: dependencies
+            run: |
+              ./tools/dep_updaters/update-ada.sh > temp-output
+              cat temp-output
+              tail -n1 temp-output | grep "NEW_VERSION=" >> "$GITHUB_ENV" || true
+              rm temp-output
+          - id: libuv
+            subsystem: deps
+            label: dependencies
+            run: |
+              ./tools/dep_updaters/update-libuv.sh > temp-output
+              cat temp-output
+              tail -n1 temp-output | grep "NEW_VERSION=" >> "$GITHUB_ENV" || true
+              rm temp-output
+          - id: undici
+            subsystem: deps
+            label: dependencies
+            run: |
+              ./tools/dep_updaters/update-undici.sh > temp-output
+              cat temp-output
+              tail -n1 temp-output | grep "NEW_VERSION=" >> "$GITHUB_ENV" || true
+              rm temp-output
+          - id: zlib
+            subsystem: deps
+            label: dependencies, zlib
+            run: |
+              ./tools/dep_updaters/update-zlib.sh > temp-output
+              cat temp-output
+              tail -n1 temp-output | grep "NEW_VERSION=" >> "$GITHUB_ENV" || true
+              rm temp-output
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        if: github.event_name == 'schedule' || inputs.id == 'all' || inputs.id == matrix.id
+        with:
+          persist-credentials: false
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        if: github.event_name == 'schedule' || inputs.id == 'all' || inputs.id == matrix.id
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          allow-prereleases: true
+      # ERROR INJECTION: Install a non-existent version of a required Python
+      # package. pip will fail with "No matching distribution found for
+      # gcovr==0.0.0", causing the entire job to exit non-zero before any
+      # dep-update scripts are executed.
+      - name: Install required Python dependencies
+        if: github.event_name == 'schedule' || inputs.id == 'all' || inputs.id == matrix.id
+        run: pip install gcovr==0.0.0
+      - run: ${{ matrix.run }}
+        if: github.event_name == 'schedule' || inputs.id == 'all' || inputs.id == matrix.id
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_USER_TOKEN }}
+      - name: Generate commit message if not set
+        if: env.COMMIT_MSG == '' && (github.event_name == 'schedule' || inputs.id == 'all' || inputs.id == matrix.id)
+        run: |
+          echo "COMMIT_MSG=${{ matrix.subsystem }}: update ${{ matrix.id }} to ${{ env.NEW_VERSION }}" >> "$GITHUB_ENV"
+      - uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1  # v8.1.1
+        if: github.event_name == 'schedule' || inputs.id == 'all' || inputs.id == matrix.id
+        with:
+          token: ${{ secrets.GH_USER_TOKEN }}
+          branch: actions/${{ github.ref_name == 'main' || format('{0}/', github.ref_name) }}tools-update-${{ matrix.id }}
+          delete-branch: true
+          commit-message: ${{ env.COMMIT_MSG }}
+          labels: ${{ matrix.label }}
+          title: '${{ matrix.subsystem }}: update ${{ matrix.id }} to ${{ env.NEW_VERSION }}'
+          body: This is an automated update of ${{ matrix.id }} to ${{ env.NEW_VERSION }}.
+          committer: ${{ github.actor }} <${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com>
+          author: Node.js GitHub Bot <github-bot@iojs.org>

@@ -1,0 +1,109 @@
+# Controlled CI Error: Test Failure
+# Base workflow: test-linux.yml
+# Error type: test-failure
+# Description: Overrides TEST_CI_ARGS to pass --test-known-globals-list pointing
+#   to a non-existent file and also injects an explicit `exit 1` after the test
+#   run, simulating a failing test suite.  The build succeeds; only the Test
+#   step exits non-zero, exactly as a genuine test regression would.
+
+name: Test Linux [test-failure]
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths-ignore:
+      - .mailmap
+      - README.md
+      - vcbuild.bat
+      - tools/actions/**
+      - tools/clang-format/**
+      - tools/dep_updaters/**
+      - test/internet/**
+      - '**.nix'
+      - .github/**
+      - '!.github/workflows/test-linux_test-failure.yaml'
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches:
+      - main
+      - canary
+      - v[0-9]+.x-staging
+      - v[0-9]+.x
+    paths-ignore:
+      - .mailmap
+      - README.md
+      - vcbuild.bat
+      - tools/actions/**
+      - tools/clang-format/**
+      - tools/dep_updaters/**
+      - test/internet/**
+      - '**.nix'
+      - .github/**
+      - '!.github/workflows/test-linux_test-failure.yaml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.14'
+  FLAKY_TESTS: keep_retrying
+  CLANG_VERSION: '19'
+  CC: ${{ (github.base_ref == 'main' || github.ref_name == 'main') && 'sccache' || '' }} clang-19
+  CXX: ${{ (github.base_ref == 'main' || github.ref_name == 'main') && 'sccache' || '' }} clang++-19
+  SCCACHE_GHA_ENABLED: ${{ github.base_ref == 'main' || github.ref_name == 'main' }}
+  SCCACHE_IDLE_TIMEOUT: '0'
+  RUSTC_VERSION: '1.82'
+
+permissions:
+  contents: read
+
+jobs:
+  test-linux:
+    if: github.event.pull_request.draft == false
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+          path: node
+      - name: Install Clang ${{ env.CLANG_VERSION }}
+        uses: ./node/.github/actions/install-clang
+        with:
+          clang-version: ${{ env.CLANG_VERSION }}
+      - name: Install Rust ${{ env.RUSTC_VERSION }}
+        run: |
+          rustup override set "$RUSTC_VERSION"
+          rustup --version
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          allow-prereleases: true
+      - name: Set up sccache
+        if: github.base_ref == 'main' || github.ref_name == 'main'
+        uses: Mozilla-Actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696  # v0.0.10
+        with:
+          version: v0.12.0
+      - name: Environment Information
+        run: npx envinfo
+      - name: Build
+        working-directory: node
+        run: make build-ci -j4 V=1 CONFIG_FLAGS="--error-on-warn --v8-enable-temporal-support"
+      # ERROR INJECTION: The test runner is given a --globals-list path that
+      # does not exist on the runner.  tools/test.py raises a FileNotFoundError
+      # and exits with a non-zero code, surfacing as a test failure.
+      # The explicit `exit 1` below acts as a fallback to guarantee failure even
+      # if the runner somehow tolerates the missing file argument.
+      - name: Test
+        working-directory: node
+        run: |
+          make test-ci -j1 V=1 \
+            TEST_CI_ARGS="-p actions --measure-flakiness 9 --globals-list /nonexistent/globals.txt" \
+            || true
+          echo "CONTROLLED FAILURE: Injected test failure — test suite reported errors."
+          exit 1

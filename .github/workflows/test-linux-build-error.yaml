@@ -59,7 +59,8 @@ jobs:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
     steps:
     # Add wrong SHA commit to the checkout
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0d50  # v6.0.3
+    # Applied correction
+      - uses: actions/checkout@v3.0.1  # v6.0.3
         with:
           persist-credentials: false
           path: node

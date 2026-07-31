@@ -1,0 +1,156 @@
+# Fix Validation Report: Command Error
+# Base workflow: test-linux.yml
+# Error workflow: test-linux_test-failure.yaml
+# Error type: command-error
+# Description: The error workflow injected a broken test command:
+#   `make test-ci` was invoked with a `--globals-list /nonexistent/globals.txt`
+#   flag pointing to a file that does not exist on the runner. tools/test.py
+#   raises FileNotFoundError and exits non-zero. An explicit `exit 1` was also
+#   appended as a guaranteed fallback failure.
+# Fix applied: The broken Test step is replaced with the clean command from
+#   test-linux.yml — `make test-ci -j1 V=1 TEST_CI_ARGS="-p actions
+#   --measure-flakiness 9"` — with no invalid flags and no forced exit.
+#   Two steps present in test-linux.yml but absent from the error workflow are
+#   also restored:
+#     - "Ensure running tests did not cause any change in the tree"
+#     - "Re-run test in a folder whose name contains unusual chars"
+# Report: A final generate-report job (if: always()) writes a Markdown summary
+#   and uploads it as an Actions artifact.
+
+name: Test Linux [fix-validation/command-error]
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.14'
+  FLAKY_TESTS: keep_retrying
+  CLANG_VERSION: '19'
+  CC: ${{ (github.base_ref == 'main' || github.ref_name == 'main') && 'sccache' || '' }} clang-19
+  CXX: ${{ (github.base_ref == 'main' || github.ref_name == 'main') && 'sccache' || '' }} clang++-19
+  SCCACHE_GHA_ENABLED: ${{ github.base_ref == 'main' || github.ref_name == 'main' }}
+  SCCACHE_IDLE_TIMEOUT: '0'
+  RUSTC_VERSION: '1.82'
+
+permissions:
+  contents: read
+
+jobs:
+  test-linux:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+          path: node
+      - name: Install Clang ${{ env.CLANG_VERSION }}
+        uses: ./node/.github/actions/install-clang
+        with:
+          clang-version: ${{ env.CLANG_VERSION }}
+      - name: Install Rust ${{ env.RUSTC_VERSION }}
+        run: |
+          rustup override set "$RUSTC_VERSION"
+          rustup --version
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          allow-prereleases: true
+      - name: Set up sccache
+        if: github.base_ref == 'main' || github.ref_name == 'main'
+        uses: Mozilla-Actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696  # v0.0.10
+        with:
+          version: v0.12.0
+      - name: Environment Information
+        run: npx envinfo
+      - name: Build
+        working-directory: node
+        run: make build-ci -j4 V=1 CONFIG_FLAGS="--error-on-warn --v8-enable-temporal-support"
+      # FIX (command-error): The broken test command is replaced with the clean
+      # invocation from test-linux.yml. The injected faults removed are:
+      #   - `--globals-list /nonexistent/globals.txt` (file does not exist)
+      #   - `|| true` (which suppressed the error only to re-raise it)
+      #   - `exit 1` (guaranteed forced failure)
+      - name: Test
+        working-directory: node
+        run: make test-ci -j1 V=1 TEST_CI_ARGS="-p actions --measure-flakiness 9"
+      # FIX: Restored steps that were stripped from the error workflow.
+      - name: Ensure running tests did not cause any change in the tree
+        working-directory: node
+        run: git add -A && git diff --name-only --exit-code --staged
+      - name: Re-run test in a folder whose name contains unusual chars
+        run: |
+          mv node "$DIR"
+          cd "$DIR"
+          ./tools/test.py --flaky-tests keep_retrying -p actions -j 4
+        env:
+          DIR: dir%20with $unusual"chars?'åß∂ƒ©∆¬…`
+
+  generate-report:
+    needs: test-linux
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate fix validation report
+        run: |
+          cat > fix-validation-report.md << 'EOF'
+          # Fix Validation Report — Command Error
+
+          **Workflow Run:** ${{ github.run_id }}
+          **Repository:** ${{ github.repository }}
+          **Branch:** ${{ github.ref_name }}
+          **Triggered by:** ${{ github.actor }}
+          EOF
+          echo "**Run date:** $(date -u)" >> fix-validation-report.md
+          cat >> fix-validation-report.md << 'EOF'
+
+          ## Error Type
+          **Command error** — the `make test-ci` invocation was broken by passing a
+          `--globals-list /nonexistent/globals.txt` flag pointing to a non-existent file.
+          `tools/test.py` raised `FileNotFoundError` and exited non-zero. An explicit
+          `exit 1` was appended as a fallback to guarantee failure even if the runner
+          tolerated the missing file argument.
+
+          ## Base Workflow
+          `test-linux_test-failure.yaml` (derived from `test-linux.yml`)
+
+          ## Fix Applied
+          The broken `Test` step is replaced with the clean command from `test-linux.yml`:
+          ```
+          make test-ci -j1 V=1 TEST_CI_ARGS="-p actions --measure-flakiness 9"
+          ```
+          The invalid `--globals-list` flag, the `|| true` suppressor, and the forced
+          `exit 1` are all removed. Two steps stripped from the error workflow are
+          restored:
+          - "Ensure running tests did not cause any change in the tree"
+          - "Re-run test in a folder whose name contains unusual chars"
+
+          ## Validation Results
+
+          | Job | Result |
+          |-----|--------|
+          EOF
+          echo "| test-linux | ${{ needs.test-linux.result }} |" >> fix-validation-report.md
+          cat >> fix-validation-report.md << 'EOF'
+
+          ## Status
+          EOF
+          if [ "${{ needs.test-linux.result }}" = "success" ]; then
+            echo "✅ **PASSED** — command error fix validated successfully." >> fix-validation-report.md
+          else
+            echo "❌ **FAILED** — job result: ${{ needs.test-linux.result }}." >> fix-validation-report.md
+          fi
+      - name: Upload fix validation report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: fix-validation-report-command-error
+          path: fix-validation-report.md
+          compression-level: 0

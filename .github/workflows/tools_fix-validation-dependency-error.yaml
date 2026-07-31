@@ -1,0 +1,172 @@
+# Fix Validation Report: Dependency Error
+# Base workflow: tools.yml
+# Error workflow: tools_dependency-error.yaml
+# Error type: dependency-error
+# Description: The error workflow injected a non-existent Python package version
+#   (gcovr==0.0.0) via pip, causing "No matching distribution found" and blocking
+#   all dep-update scripts from running.
+# Fix applied: The broken "Install required Python dependencies" step is removed.
+#   No spurious pip install is needed for the dep-update matrix jobs. The rest of
+#   the workflow is identical to the base tools.yml structure.
+# Report: A final generate-report job (if: always()) writes a Markdown summary
+#   and uploads it as an Actions artifact.
+
+name: Tools and deps update [fix-validation/dependency-error]
+
+on:
+  workflow_dispatch:
+    inputs:
+      id:
+        description: The ID of the job to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - acorn
+          - ada
+          - libuv
+          - undici
+          - zlib
+
+env:
+  PYTHON_VERSION: '3.14'
+
+permissions:
+  contents: read
+
+jobs:
+  tools-deps-update:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: acorn
+            subsystem: deps
+            label: dependencies
+            run: |
+              ./tools/dep_updaters/update-acorn.sh > temp-output
+              cat temp-output
+              tail -n1 temp-output | grep "NEW_VERSION=" >> "$GITHUB_ENV" || true
+              rm temp-output
+          - id: ada
+            subsystem: deps
+            label: dependencies
+            run: |
+              ./tools/dep_updaters/update-ada.sh > temp-output
+              cat temp-output
+              tail -n1 temp-output | grep "NEW_VERSION=" >> "$GITHUB_ENV" || true
+              rm temp-output
+          - id: libuv
+            subsystem: deps
+            label: dependencies
+            run: |
+              ./tools/dep_updaters/update-libuv.sh > temp-output
+              cat temp-output
+              tail -n1 temp-output | grep "NEW_VERSION=" >> "$GITHUB_ENV" || true
+              rm temp-output
+          - id: undici
+            subsystem: deps
+            label: dependencies
+            run: |
+              ./tools/dep_updaters/update-undici.sh > temp-output
+              cat temp-output
+              tail -n1 temp-output | grep "NEW_VERSION=" >> "$GITHUB_ENV" || true
+              rm temp-output
+          - id: zlib
+            subsystem: deps
+            label: dependencies, zlib
+            run: |
+              ./tools/dep_updaters/update-zlib.sh > temp-output
+              cat temp-output
+              tail -n1 temp-output | grep "NEW_VERSION=" >> "$GITHUB_ENV" || true
+              rm temp-output
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        if: inputs.id == 'all' || inputs.id == matrix.id
+        with:
+          persist-credentials: false
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        if: inputs.id == 'all' || inputs.id == matrix.id
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          allow-prereleases: true
+      # FIX: The "Install required Python dependencies" step that ran
+      # `pip install gcovr==0.0.0` has been removed. That step was the injected
+      # error — gcovr==0.0.0 does not exist on PyPI and caused pip to exit
+      # non-zero before any dep-update script could run.
+      - run: ${{ matrix.run }}
+        if: inputs.id == 'all' || inputs.id == matrix.id
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_USER_TOKEN }}
+      - name: Generate commit message if not set
+        if: env.COMMIT_MSG == '' && (inputs.id == 'all' || inputs.id == matrix.id)
+        run: |
+          echo "COMMIT_MSG=${{ matrix.subsystem }}: update ${{ matrix.id }} to ${{ env.NEW_VERSION }}" >> "$GITHUB_ENV"
+      - uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1  # v8.1.1
+        if: inputs.id == 'all' || inputs.id == matrix.id
+        with:
+          token: ${{ secrets.GH_USER_TOKEN }}
+          branch: actions/${{ github.ref_name == 'main' || format('{0}/', github.ref_name) }}tools-update-${{ matrix.id }}
+          delete-branch: true
+          commit-message: ${{ env.COMMIT_MSG }}
+          labels: ${{ matrix.label }}
+          title: '${{ matrix.subsystem }}: update ${{ matrix.id }} to ${{ env.NEW_VERSION }}'
+          body: This is an automated update of ${{ matrix.id }} to ${{ env.NEW_VERSION }}.
+          committer: ${{ github.actor }} <${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com>
+          author: Node.js GitHub Bot <github-bot@iojs.org>
+
+  generate-report:
+    needs: tools-deps-update
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate fix validation report
+        run: |
+          cat > fix-validation-report.md << 'EOF'
+          # Fix Validation Report — Dependency Error
+
+          **Workflow Run:** ${{ github.run_id }}
+          **Repository:** ${{ github.repository }}
+          **Branch:** ${{ github.ref_name }}
+          **Triggered by:** ${{ github.actor }}
+          EOF
+          echo "**Run date:** $(date -u)" >> fix-validation-report.md
+          cat >> fix-validation-report.md << 'EOF'
+
+          ## Error Type
+          **Dependency error** — a non-existent Python package version (`gcovr==0.0.0`)
+          was passed to `pip install`, causing "No matching distribution found" and
+          preventing all dependency-update scripts from executing.
+
+          ## Base Workflow
+          `tools_dependency-error.yaml` (derived from `tools.yml`)
+
+          ## Fix Applied
+          Removed the injected `Install required Python dependencies` step that ran
+          `pip install gcovr==0.0.0`. The dep-update matrix jobs do not require gcovr;
+          that install was solely the error injection point.
+
+          ## Validation Results
+
+          | Job | Result |
+          |-----|--------|
+          EOF
+          echo "| tools-deps-update | ${{ needs.tools-deps-update.result }} |" >> fix-validation-report.md
+          cat >> fix-validation-report.md << 'EOF'
+
+          ## Status
+          EOF
+          if [ "${{ needs.tools-deps-update.result }}" = "success" ]; then
+            echo "✅ **PASSED** — dependency error fix validated successfully." >> fix-validation-report.md
+          else
+            echo "❌ **FAILED** — job result: ${{ needs.tools-deps-update.result }}." >> fix-validation-report.md
+          fi
+      - name: Upload fix validation report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: fix-validation-report-dependency-error
+          path: fix-validation-report.md
+          compression-level: 0

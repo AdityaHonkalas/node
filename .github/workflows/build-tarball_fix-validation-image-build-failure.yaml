@@ -1,0 +1,171 @@
+# Fix Validation Report: Other Controlled Error (Image Build Failure)
+# Base workflow: build-tarball.yml
+# Error workflow: build-tarball_image-build-failure.yaml
+# Error type: image-build-failure (other controlled error)
+# Description: The error workflow injected a `docker build` step that used an
+#   inline Dockerfile referencing a non-existent base image tag
+#   (node:99999-nonexistent). Docker failed with "manifest unknown" / "pull
+#   access denied", exiting non-zero and preventing the tarball from ever being
+#   produced. The dependent test-tarball-linux job was therefore never scheduled.
+# Fix applied: The "Build Docker image for distribution verification" step
+#   (the docker build injection) is removed entirely. The rest of the workflow —
+#   make tarball → upload artifact → test tarball — is preserved unchanged from
+#   build-tarball_image-build-failure.yaml.
+# Report: A final generate-report job (if: always()) runs after both
+#   build-tarball and test-tarball-linux, writes a Markdown summary with per-job
+#   results, and uploads it as an Actions artifact.
+
+name: Build from tarball [fix-validation/image-build-failure]
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.14'
+  FLAKY_TESTS: keep_retrying
+  CLANG_VERSION: '19'
+
+permissions:
+  contents: read
+
+jobs:
+  build-tarball:
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          allow-prereleases: true
+      - name: Environment Information
+        run: npx envinfo
+      # FIX (image-build-failure): The "Build Docker image for distribution
+      # verification" step is removed. That step built from an inline Dockerfile
+      # containing `FROM node:99999-nonexistent` — a tag that does not exist.
+      # Docker exited non-zero with "manifest unknown", blocking the tarball step
+      # from ever running. Removing the step restores the normal build path.
+      - name: Make tarball
+        run: |
+          export DISTTYPE=nightly
+          export DATESTRING=$(date "+%Y-%m-%d")
+          export COMMIT=$(git rev-parse --short=10 "$GITHUB_SHA")
+          ./configure && make tar -j4 SKIP_XZ=1
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: tarballs
+          path: '*.tar.gz'
+          compression-level: 0
+
+  test-tarball-linux:
+    needs: build-tarball
+    runs-on: ubuntu-24.04-arm
+    env:
+      CC: ${{ (github.base_ref == 'main' || github.ref_name == 'main') && 'sccache' || '' }} clang-19
+      CXX: ${{ (github.base_ref == 'main' || github.ref_name == 'main') && 'sccache' || '' }} clang++-19
+      SCCACHE_GHA_ENABLED: ${{ github.base_ref == 'main' || github.ref_name == 'main' }}
+      SCCACHE_IDLE_TIMEOUT: '0'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/actions/install-clang
+          sparse-checkout-cone-mode: false
+      - name: Install Clang ${{ env.CLANG_VERSION }}
+        uses: ./.github/actions/install-clang
+        with:
+          clang-version: ${{ env.CLANG_VERSION }}
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          allow-prereleases: true
+      - name: Set up sccache
+        if: github.base_ref == 'main' || github.ref_name == 'main'
+        uses: Mozilla-Actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696  # v0.0.10
+        with:
+          version: v0.12.0
+      - name: Environment Information
+        run: npx envinfo
+      - name: Download tarball
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: tarballs
+          path: tarballs
+      - name: Extract tarball
+        run: |
+          tar xzf tarballs/*.tar.gz -C "$RUNNER_TEMP"
+          echo "TAR_DIR=$RUNNER_TEMP/$(basename tarballs/*.tar.gz .tar.gz)" >> "$GITHUB_ENV"
+      - name: Build
+        run: make -C "$TAR_DIR" build-ci -j4 V=1
+      - name: Test
+        run: make -C "$TAR_DIR" test-ci -j1 V=1 TEST_CI_ARGS="-p dots --measure-flakiness 9"
+
+  generate-report:
+    needs: [build-tarball, test-tarball-linux]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate fix validation report
+        run: |
+          cat > fix-validation-report.md << 'EOF'
+          # Fix Validation Report — Other Controlled Error (Image Build Failure)
+
+          **Workflow Run:** ${{ github.run_id }}
+          **Repository:** ${{ github.repository }}
+          **Branch:** ${{ github.ref_name }}
+          **Triggered by:** ${{ github.actor }}
+          EOF
+          echo "**Run date:** $(date -u)" >> fix-validation-report.md
+          cat >> fix-validation-report.md << 'EOF'
+
+          ## Error Type
+          **Other controlled error — image build failure** — an injected `docker build`
+          step used an inline Dockerfile with `FROM node:99999-nonexistent`. Docker
+          failed with "manifest unknown" / "pull access denied", exiting non-zero before
+          the tarball was produced. The downstream `test-tarball-linux` job was never
+          scheduled as a result.
+
+          ## Base Workflow
+          `build-tarball_image-build-failure.yaml` (derived from `build-tarball.yml`)
+
+          ## Fix Applied
+          Removed the "Build Docker image for distribution verification" step entirely.
+          That step's sole purpose was error injection — it used a non-existent Docker
+          image tag (`node:99999-nonexistent`) and had no legitimate role in the tarball
+          build process. All remaining steps (make tarball, upload artifact, download
+          artifact, build from tarball, test) are preserved unchanged.
+
+          ## Validation Results
+
+          | Job | Result |
+          |-----|--------|
+          EOF
+          echo "| build-tarball      | ${{ needs.build-tarball.result }} |" >> fix-validation-report.md
+          echo "| test-tarball-linux | ${{ needs.test-tarball-linux.result }} |" >> fix-validation-report.md
+          cat >> fix-validation-report.md << 'EOF'
+
+          ## Status
+          EOF
+          if [ "${{ needs.build-tarball.result }}" = "success" ] && \
+             [ "${{ needs.test-tarball-linux.result }}" = "success" ]; then
+            echo "✅ **PASSED** — image build failure fix validated successfully." >> fix-validation-report.md
+          else
+            echo "❌ **FAILED** — one or more jobs did not succeed." >> fix-validation-report.md
+            echo "" >> fix-validation-report.md
+            echo "build-tarball: ${{ needs.build-tarball.result }}" >> fix-validation-report.md
+            echo "test-tarball-linux: ${{ needs.test-tarball-linux.result }}" >> fix-validation-report.md
+          fi
+      - name: Upload fix validation report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: fix-validation-report-image-build-failure
+          path: fix-validation-report.md
+          compression-level: 0

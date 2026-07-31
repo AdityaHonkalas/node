@@ -1,0 +1,211 @@
+# Fix Validation Report: Syntax Error
+# Base workflow: linters.yml
+# Error workflow: linters_syntax-error.yaml
+# Error type: syntax-error
+# Description: The error workflow introduced two injected faults:
+#   1. An unclosed shell command substitution `$(` in the "Lint JavaScript files"
+#      step of lint-js-and-md, causing bash to report a syntax error and exit
+#      non-zero immediately before any linting work began.
+#   2. A corrupted actions/setup-python SHA in the lint-cpp job
+#      ("@a309ff8b426b58ec0e2a45f0f anthropic-provider-0f869d46889d02405") that
+#      prevented the action from resolving, failing the step at action load time.
+# Fix applied:
+#   1. The unclosed `$(` in "Lint JavaScript files" is removed; the correct shell
+#      block from linters.yml (lines 109-133) is restored verbatim.
+#   2. The corrupted setup-python SHA in lint-cpp is restored to the canonical
+#      value: a309ff8b426b58ec0e2a45f0f869d46889d02405
+# Report: A final generate-report job (if: always()) collects per-job results,
+#   writes a Markdown table, and uploads it as an Actions artifact.
+
+name: Linters [fix-validation/syntax-error]
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.14'
+  NODE_VERSION: lts/*
+
+permissions:
+  contents: read
+
+jobs:
+  lint-addon-docs:
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Use Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Environment Information
+        run: npx envinfo
+      - name: Lint addon docs
+        run: NODE=$(command -v node) make lint-addon-docs
+
+  lint-cpp:
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+      # FIX (syntax-error #2): The corrupted action SHA
+      # "@a309ff8b426b58ec0e2a45f0f anthropic-provider-0f869d46889d02405"
+      # is restored to the canonical pinned SHA:
+      # a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          allow-prereleases: true
+      - name: Environment Information
+        run: npx envinfo
+      - name: Lint C/C++ files
+        run: make lint-cpp
+
+  lint-js-and-md:
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Use Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Environment Information
+        run: npx envinfo
+      # FIX (syntax-error #1): The unclosed `$(` command substitution is removed.
+      # The correct shell block from linters.yml is restored: the NODE variable is
+      # assigned via `$(command -v node)` on the same line as `make lint-js`,
+      # with proper exit-code handling and auto-fix guidance.
+      - name: Lint JavaScript files
+        run: |
+          set +e
+          NODE=$(command -v node) make lint-js
+          EXIT_CODE="$?"
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo
+            echo 'ERROR: The JavaScript lint validation failed (the errors are logged above).'
+            echo '       Please fix the lint errors.'
+            if NODE=$(command -v node) make lint-js-fix > /dev/null 2>&1; then
+              echo '       Run:'
+              echo '          make lint-js-fix'
+              echo '       to fix the lint issues.'
+              git --no-pager diff
+            elif git diff --quiet --exit-code; then
+              echo '       None of the issue is auto-fixable, so manual fixes for'
+              echo '       all of the issues are required.'
+            else
+              echo '       Run:'
+              echo '          make lint-js-fix'
+              echo '       to fix the auto-fixable lint issues.'
+              echo '       Note that some manual fixes are also required.'
+            fi
+            echo
+            exit "$EXIT_CODE"
+          fi
+      - name: Get release version numbers
+        if: ${{ github.event.pull_request && github.event.pull_request.base.ref == github.event.pull_request.base.repo.default_branch }}
+        id: get-released-versions
+        run: ./tools/lint-md/list-released-versions-from-changelogs.mjs >> $GITHUB_OUTPUT
+      - name: Lint markdown files
+        run: |
+          echo "::add-matcher::.github/workflows/remark-lint-problem-matcher.json"
+          NODE=$(command -v node) make lint-md
+        env:
+          NODE_RELEASED_VERSIONS: ${{ steps.get-released-versions.outputs.NODE_RELEASED_VERSIONS }}
+
+  lint-py:
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          allow-prereleases: true
+      - name: Environment Information
+        run: npx envinfo
+      - name: Lint Python
+        run: |
+          make lint-py-build
+          make lint-py
+
+  generate-report:
+    needs: [lint-addon-docs, lint-cpp, lint-js-and-md, lint-py]
+    if: always()
+    runs-on: ubuntu-slim
+    steps:
+      - name: Generate fix validation report
+        run: |
+          cat > fix-validation-report.md << 'EOF'
+          # Fix Validation Report — Syntax Error
+
+          **Workflow Run:** ${{ github.run_id }}
+          **Repository:** ${{ github.repository }}
+          **Branch:** ${{ github.ref_name }}
+          **Triggered by:** ${{ github.actor }}
+          EOF
+          echo "**Run date:** $(date -u)" >> fix-validation-report.md
+          cat >> fix-validation-report.md << 'EOF'
+
+          ## Error Type
+          **Syntax error** — two injected faults:
+          1. An unclosed shell command substitution `$(` in the `lint-js-and-md` job's
+             "Lint JavaScript files" step caused bash to fail at parse time with a syntax
+             error before any linting work ran.
+          2. A corrupted `actions/setup-python` SHA in `lint-cpp`
+             (`@a309ff8b426b58ec0e2a45f0f anthropic-provider-0f869d46889d02405`) caused
+             the action loader to fail when resolving the step reference.
+
+          ## Base Workflow
+          `linters_syntax-error.yaml` (derived from `linters.yml`)
+
+          ## Fix Applied
+          1. **Shell syntax fix**: Restored the correct `Lint JavaScript files` run block
+             from `linters.yml` — `NODE=$(command -v node) make lint-js` with proper
+             exit-code handling and auto-fix guidance. The stray unclosed `$(` is removed.
+          2. **Corrupted SHA fix**: Restored the canonical `setup-python` SHA
+             `a309ff8b426b58ec0e2a45f0f869d46889d02405` in the `lint-cpp` job.
+
+          ## Validation Results
+
+          | Job | Result |
+          |-----|--------|
+          EOF
+          echo "| lint-addon-docs  | ${{ needs.lint-addon-docs.result }} |" >> fix-validation-report.md
+          echo "| lint-cpp         | ${{ needs.lint-cpp.result }} |" >> fix-validation-report.md
+          echo "| lint-js-and-md   | ${{ needs.lint-js-and-md.result }} |" >> fix-validation-report.md
+          echo "| lint-py          | ${{ needs.lint-py.result }} |" >> fix-validation-report.md
+          cat >> fix-validation-report.md << 'EOF'
+
+          ## Status
+          EOF
+          if [ "${{ needs.lint-addon-docs.result }}" = "success" ] && \
+             [ "${{ needs.lint-cpp.result }}" = "success" ] && \
+             [ "${{ needs.lint-js-and-md.result }}" = "success" ] && \
+             [ "${{ needs.lint-py.result }}" = "success" ]; then
+            echo "✅ **PASSED** — syntax error fix validated successfully." >> fix-validation-report.md
+          else
+            echo "❌ **FAILED** — one or more jobs did not succeed." >> fix-validation-report.md
+            echo "" >> fix-validation-report.md
+            echo "lint-addon-docs: ${{ needs.lint-addon-docs.result }}" >> fix-validation-report.md
+            echo "lint-cpp: ${{ needs.lint-cpp.result }}" >> fix-validation-report.md
+            echo "lint-js-and-md: ${{ needs.lint-js-and-md.result }}" >> fix-validation-report.md
+            echo "lint-py: ${{ needs.lint-py.result }}" >> fix-validation-report.md
+          fi
+      - name: Upload fix validation report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: fix-validation-report-syntax-error
+          path: fix-validation-report.md
+          compression-level: 0
